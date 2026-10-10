@@ -876,7 +876,7 @@ function App() {
   // A self-hosted server running the moment picker on a local LLM
   // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
   const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  const keysMissing = !billingEnabled && !geminiOk;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -1534,7 +1534,7 @@ function App() {
                 <span className="font-medium text-ink">Required API keys missing.</span>{' '}
                 <span className="text-muted">
                   {!geminiOk && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
+                    ? 'Set your Gemini API key to use OpenShorts.'
                     : !geminiOk
                       ? 'Set your Gemini API key to use OpenShorts.'
                       : 'Set your Upload-Post API key to use OpenShorts.'}
@@ -1647,10 +1647,10 @@ function App() {
                     </div>
                     <h2 className="text-base font-medium text-ink lowercase">Social Integration</h2>
                   </div>
-                  <span className="badge-warn">Required</span>
+                  <span className="readout">Optional</span>
                 </div>
                 <p className="text-xs text-muted mb-6 leading-relaxed">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
+                  Only needed to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
                   Includes a <strong>free tier</strong> (no credit card required).
                 </p>
                 <div className="space-y-4">
@@ -2379,7 +2379,7 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts needs a <strong className="text-ink2">Gemini</strong> API key to generate clips. An <strong className="text-ink2">Upload-Post</strong> API key is optional — only needed to publish clips to social media. Both have free tiers.
           </p>
 
           {/* Gemini block */}
@@ -2419,7 +2419,7 @@ function App() {
             {!uploadPostKey && (
               <>
                 <p className="text-xs text-muted">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
+                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed. Not needed to generate or download clips.
                 </p>
                 <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
                   <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-brass underline">app.upload-post.com</a></li>
