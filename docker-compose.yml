@@ -2,12 +2,16 @@ services:
   backend:
     build: .
     container_name: openshorts-backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - WHISPER_COMPUTE=${WHISPER_COMPUTE:-int8}
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
     volumes:
-      - .:/app
-      - /app/__pycache__
-      - ./output:/app/output
+      - output:/app/output
+      - hf_cache:/app/.cache/huggingface
     restart: unless-stopped
 
   frontend:
@@ -15,11 +19,8 @@ services:
       context: ./dashboard
       target: dev
     container_name: openshorts-frontend
-    ports:
-      - "5175:5173"
-    volumes:
-      - ./dashboard:/app
-      - /app/node_modules
+    expose:
+      - "5173"
     restart: unless-stopped
     depends_on:
       - backend
@@ -29,10 +30,10 @@ services:
       context: .
       dockerfile: render-service/Dockerfile
     container_name: openshorts-renderer
-    ports:
-      - "3100:3100"
+    expose:
+      - "3100"
     volumes:
-      - ./output:/output
+      - output:/output
     environment:
       - REMOTION_BUNDLE_PATH=/app/remotion
       - OUTPUT_DIR=/output
@@ -40,3 +41,7 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  output:
+  hf_cache:
