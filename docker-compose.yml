@@ -9,6 +9,27 @@ services:
       - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
       - WHISPER_COMPUTE=${WHISPER_COMPUTE:-int8}
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
+    # Large uploads (up to MAX_FILE_SIZE_MB = 2 GB in app.py) stream through
+    # the reverse proxy in front of this service. A 502 ~60 s after starting
+    # an upload is the proxy's read/responding timeout killing a slow POST to
+    # /api/process, not the app rejecting the file.
+    #
+    # Plain `docker compose up` behind your own Traefik: attach a buffering
+    # middleware with a 2 GB cap to the router that fronts this service, e.g.
+    #   traefik.http.middlewares.openshorts-upload.buffering.maxRequestBodyBytes=2147483648
+    # and raise the static respondingTimeouts (readTimeout/idleTimeout, e.g.
+    # 1800s) in traefik.yml — respondingTimeouts are static config and cannot
+    # be set with labels.
+    #
+    # Coolify (Traefik is managed for you): the static timeouts are not in this
+    # repo. In the Coolify dashboard for this service, add the same buffering
+    # label under "Labels", and if uploads still 502 at a fixed duration, raise
+    # the proxy read timeout in the Coolify/Traefik settings (or put the upload
+    # on a direct backend route). The uvicorn --timeout-keep-alive 1200 in the
+    # Dockerfile covers the app side of the same wait.
+    labels:
+      - "traefik.http.middlewares.openshorts-upload.buffering.maxRequestBodyBytes=2147483648"
+      - "traefik.http.middlewares.openshorts-upload.buffering.memRequestBodyBytes=67108864"
     volumes:
       - output:/app/output
       - hf_cache:/app/.cache/huggingface
