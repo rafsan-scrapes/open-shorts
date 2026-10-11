@@ -28,6 +28,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import llm_providers
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
@@ -1949,6 +1950,111 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
+def _provider_job_config():
+    """Per-job third-party provider snapshot (app.py X-LLM-* headers), or None."""
+    try:
+        cfg = llm_backend.job_provider_config()
+    except Exception:
+        return None
+    if not cfg or not (cfg.get("provider") or "").strip().lower() in llm_providers.PROVIDERS:
+        return None
+    if not (cfg.get("base_url") or "").strip() or not (cfg.get("model") or "").strip():
+        return None
+    return {"provider": (cfg["provider"] or "").strip().lower(),
+            "base_url": cfg["base_url"], "model": cfg["model"],
+            "api_key": cfg.get("api_key") or "",
+            "extra_headers": llm_providers.extra_headers(cfg["provider"])}
+
+
+def _provider_display(cfg):
+    return f"{cfg['provider']} (model {cfg['model']})"
+
+
+def _run_stage_split_with_failover(state, gemini_client, gemini_model,
+                                   provider_cfg, items, build_prompt,
+                                   schema, key, costs, label):
+    """_run_stage_split with sticky per-call failover to Gemini.
+
+    Each leaf LLM call first tries the third-party provider (until the first
+    failure); after a failure that same call runs on Gemini and every later
+    call stays on Gemini, because scores from different models are not
+    comparable. Calls that already succeeded on the provider are kept.
+    """
+    if not items:
+        return []
+
+    def _leaf_gemini(prompt):
+        parsed, cost = _run_gemini_stage(gemini_client, gemini_model, prompt, schema)
+        if cost:
+            costs.append(cost)
+        return list(parsed.get(key) or [])
+
+    def _leaf_provider(prompt):
+        full = {"provider": provider_cfg["provider"],
+                "base_url": provider_cfg["base_url"],
+                "model": provider_cfg["model"],
+                "api_key": provider_cfg["api_key"],
+                "extra_headers": provider_cfg.get("extra_headers") or {}}
+        parsed, cost = llm_backend.generate_json(prompt, schema, config=full)
+        if cost:
+            costs.append(cost)
+        return list(parsed.get(key) or [])
+
+    def _split(sub_items, bisected=False):
+        prompt = build_prompt(sub_items)
+        if state.get("switched"):
+            try:
+                return _leaf_gemini(prompt)
+            except gemini_worker.GeminiBlockedError:
+                if len(sub_items) == 1:
+                    print(f"   🚫 {label}: Gemini blocked window "
+                          f"{sub_items[0].get('id')} on its own; skipping it")
+                    return []
+                mid = len(sub_items) // 2
+                print(f"   🚫 {label}: Gemini blocked a batch of {len(sub_items)}; "
+                      f"retrying as {mid} + {len(sub_items) - mid}")
+                return (_split(sub_items[:mid], True) + _split(sub_items[mid:], True))
+        try:
+            return _leaf_provider(prompt)
+        except llm_backend.ProviderCallError as e:
+            kind = getattr(e, "kind", "bad_response")
+            if kind == "context_length" and len(sub_items) > 1 and not bisected:
+                # Reuse the batch bisection once before falling back: free
+                # models have small contexts.
+                mid = len(sub_items) // 2
+                print(f"   ⚠️ {label}: {_provider_display(provider_cfg)} hit the "
+                      f"context limit on {len(sub_items)} windows; "
+                      f"retrying as {mid} + {len(sub_items) - mid}")
+                try:
+                    return (_split(sub_items[:mid], True) + _split(sub_items[mid:], True))
+                except llm_backend.ProviderCallError as e2:
+                    _switch(label, e2)
+                    return _split(sub_items, True)
+            else:
+                _switch(label, e)
+                return _split(sub_items, True)
+        except gemini_worker.GeminiBlockedError:
+            # Should not come from the provider path, but never lose the job.
+            _switch(label, RuntimeError("safety refusal"))
+            return _split(sub_items, True)
+        except Exception as e:
+            # Non-retryable / unexpected provider error: fall back, never swallow.
+            _switch(label, e)
+            return _split(sub_items, True)
+
+    def _switch(where, err):
+        if state.get("switched"):
+            return
+        reason = llm_providers.scrub(str(err))[:300]
+        state["switched"] = True
+        state["switched_at"] = where
+        state["reason"] = reason
+        print(f"⚠️ {_provider_display(provider_cfg)} failed on {where}: {reason}. "
+              f"Continuing with Gemini for the rest of this job.")
+
+    return _split(list(items))
+
+
 def get_viral_clips(transcript_result, video_duration):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
@@ -1958,7 +2064,22 @@ def get_viral_clips(transcript_result, video_duration):
     word boundaries so clips don't start/end mid-word.
     """
     language = str(transcript_result.get('language') or 'unknown')
-    if llm_backend.active():
+    provider_cfg = _provider_job_config()
+    fail_state = {"switched": False, "switched_at": None, "reason": None}
+    if provider_cfg:
+        # Per-job third-party primary with sticky Gemini fallback: Gemini is
+        # still mandatory (frame stages + fallback need it).
+        print("\U0001f916  Analyzing with "
+              f"{_provider_display(provider_cfg)} (2-pass: score → detail), "
+              f"fallback Gemini...")
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            print("❌ Error: GEMINI_API_KEY not found in environment variables "
+                  "(the primary AI provider needs Gemini as its fallback).")
+            return None
+        client = genai.Client(api_key=api_key)
+        model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+    elif llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
         model_name = llm_backend.model_name()
@@ -1973,6 +2094,14 @@ def get_viral_clips(transcript_result, video_duration):
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
+
+    def _run_stage(client_, model_, items, build_prompt, schema, key_, costs_, label_):
+        if provider_cfg:
+            return _run_stage_split_with_failover(
+                fail_state, client, model_name, provider_cfg,
+                items, build_prompt, schema, key_, costs_, label_)
+        return _run_stage_split(
+            client_, model_, items, build_prompt, schema, key_, costs_, label_)
 
     # Full word list — ground truth for snapping cut points.
     words = []
@@ -2013,10 +2142,13 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        for batch in score_batches(windows, SCORE_BATCH):
-            scored.extend(_run_stage_split(
+        batches = list(score_batches(windows, SCORE_BATCH))
+        for i, batch in enumerate(batches, 1):
+            label = (f"scoring batch {i}/{len(batches)}" if len(batches) > 1
+                     else "scoring")
+            scored.extend(_run_stage(
                 client, model_name, batch, _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+                gemini_worker.ScoreResponse, "windows", costs, label))
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -2041,7 +2173,7 @@ def get_viral_clips(transcript_result, video_duration):
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
-        shorts = _run_stage_split(client, model_name, shortlist,
+        shorts = _run_stage(client, model_name, shortlist,
                                   _detail_prompt_for(min_clips, max_clips),
                                   gemini_worker.DetailResponse, "shorts", costs, "detail")
 
@@ -2058,7 +2190,7 @@ def get_viral_clips(transcript_result, video_duration):
                 missing = min_clips - len(shorts)
                 print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
                       f"asking the {len(spare)} unused window(s) for {missing} more.")
-                extra = _run_stage_split(
+                extra = _run_stage(
                     client, model_name, spare,
                     _detail_prompt_for(missing, max(missing, len(spare))),
                     gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
@@ -2108,6 +2240,17 @@ def get_viral_clips(transcript_result, video_duration):
         result = {"shorts": shorts}
         if cost_analysis:
             result["cost_analysis"] = cost_analysis
+        if provider_cfg:
+            used = "gemini" if fail_state.get("switched") else provider_cfg["provider"]
+            result["provider"] = {
+                "requested_provider": provider_cfg["provider"],
+                "requested_model": provider_cfg["model"],
+                "used_provider": used,
+                "used_model": model_name if used == "gemini" else provider_cfg["model"],
+                "switched": bool(fail_state.get("switched")),
+                "switched_at": fail_state.get("switched_at"),
+                "reason": fail_state.get("reason"),
+            }
         return result
     except gemini_worker.GeminiBlockedError as e:
         # Content-policy rejection: propagate so the job fails with the real

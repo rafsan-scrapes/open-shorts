@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
+import LlmProviderCard from './components/LlmProviderCard';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
@@ -293,6 +294,15 @@ function App() {
   const [durableClips, setDurableClips] = useState({});
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  // Optional primary AI provider for the transcript stages (Gemini stays required).
+  const [llmProvider, setLlmProvider] = useState(() => localStorage.getItem('llm_provider') || 'gemini');
+  const [llmProviderKey, setLlmProviderKey] = useState(() => localStorage.getItem('llm_provider_key') || '');
+  const [llmProviderModels, setLlmProviderModels] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('llm_provider_models') || '{}'); } catch { return {}; }
+  });
+  const llmProviderModel = llmProviderModels[llmProvider] || '';
+  const setLlmProviderModel = (v) => setLlmProviderModels((m) => ({ ...m, [llmProvider]: v }));
+  const [llmProviderError, setLlmProviderError] = useState('');
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -733,6 +743,14 @@ function App() {
   }, [apiKey]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('llm_provider', llmProvider);
+      localStorage.setItem('llm_provider_models', JSON.stringify(llmProviderModels));
+      if (llmProviderKey) localStorage.setItem('llm_provider_key', llmProviderKey);
+    } catch (_) { /* ignore */ }
+  }, [llmProvider, llmProviderModels, llmProviderKey]);
+
+  useEffect(() => {
     if (uploadPostKey) {
       localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
     }
@@ -1039,6 +1057,14 @@ function App() {
       setShowKeyModal(true);
       return;
     }
+    // Optional provider selected but key or model empty: block, don't silently use Gemini.
+    if (!billingEnabled && llmProvider !== 'gemini'
+        && (!llmProviderKey.trim() || !llmProviderModel.trim())) {
+      setLlmProviderError('Enter key and model, or choose Gemini only.');
+      setActiveTab('settings');
+      return;
+    }
+    setLlmProviderError('');
     // Past every gate, so this request is really running: nothing left to resume.
     clearPendingJob();
     setStatus('processing');
@@ -1060,6 +1086,13 @@ function App() {
       // BYOK sends the Gemini header; managed users rely on the bearer token
       // that apiFetch attaches automatically.
       const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      // Per-job AI provider snapshot (headers, never the URL). Changing
+      // Settings mid-job can't affect the running job.
+      if (!billingEnabled && llmProvider !== 'gemini') {
+        headers['X-LLM-Provider'] = llmProvider;
+        headers['X-LLM-Model'] = llmProviderModel.trim();
+        headers['X-LLM-Key'] = llmProviderKey;
+      }
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
@@ -1638,6 +1671,17 @@ function App() {
               ) : (
                 <>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              {llmProviderError && (
+                <p className="mt-2 text-xs text-danger">{llmProviderError}</p>
+              )}
+              <LlmProviderCard
+                provider={llmProvider}
+                setProvider={(v) => { setLlmProvider(v); setLlmProviderError(''); }}
+                providerKey={llmProviderKey}
+                setProviderKey={setLlmProviderKey}
+                providerModel={llmProviderModel}
+                setProviderModel={setLlmProviderModel}
+              />
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -2027,6 +2071,9 @@ function App() {
                   )}
                 </div>
 
+                {llmProviderError && (
+                  <p className="text-xs text-danger text-center">{llmProviderError}</p>
+                )}
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
@@ -2204,6 +2251,20 @@ function App() {
 
                 {status === 'complete' && results?.clips?.length > 0 && (
                   <div className="mb-2 space-y-2">
+                    {/* Which AI picked the moments, and whether it fell back to Gemini mid-job. */}
+                    {results?.provider && results.provider.requested_provider && (
+                      <div className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-rule text-sm">
+                        <span className="text-muted">
+                          Moments picked by {results.provider.switched ? 'Gemini (fallback)' :
+                            `${results.provider.requested_provider} · ${results.provider.requested_model}`}.
+                        </span>
+                        {results.provider.switched && (
+                          <span className="text-ink"> {results.provider.requested_provider} failed
+                          {results.provider.switched_at ? ` on ${results.provider.switched_at}` : ''} —
+                          continued on Gemini. {results.provider.reason || ''}</span>
+                        )}
+                      </div>
+                    )}
                     {/* Partial job: the clips on screen come from the first N
                         minutes only. Say so, and sell the rest of the video. */}
                     {partialJob && (
