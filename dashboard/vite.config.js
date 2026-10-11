@@ -31,16 +31,12 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
-      // timeout/proxyTimeout are passed to http-proxy: a 1 GB upload on a
-      // slow link streams for tens of minutes through this dev proxy
-      // (docker-compose runs the `dev` stage), so the defaults must not cut
-      // it off before the backend has the whole body. 3600000 ms = 1 h.
-      '/api': { target: backend, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
-      '/videos': { target: backend, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
-      '/thumbnails': { target: backend, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
-      '/gallery': { target: backend, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
-      '/video': { target: backend, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
-      '/render': { target: renderer, changeOrigin: true, timeout: 3600000, proxyTimeout: 3600000 },
+      '/api': { target: backend, changeOrigin: true },
+      '/videos': { target: backend, changeOrigin: true },
+      '/thumbnails': { target: backend, changeOrigin: true },
+      '/gallery': { target: backend, changeOrigin: true },
+      '/video': { target: backend, changeOrigin: true },
+      '/render': { target: renderer, changeOrigin: true },
     }
   }
 })

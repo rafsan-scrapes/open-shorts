@@ -134,11 +134,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
   CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
 
-# --timeout-keep-alive 1200 keeps a slow upload connection open while the
-# client streams the body: a 1 GB file at ~5 Mbps takes ~27 min, and the
-# default 5 s keep-alive lets the server (or the proxy in front of it) drop
-# an upload that pauses between TCP segments, surfacing as a 502 from
-# Traefik. --timeout-graceful-shutdown stays small (see above): it only
-# bounds connection draining on SIGTERM, and DRAIN_TIMEOUT_SECONDS must stay
-# below the platform's stop grace period.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-keep-alive", "1200", "--timeout-graceful-shutdown", "15"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "15"]
