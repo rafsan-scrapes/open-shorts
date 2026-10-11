@@ -1,6 +1,5 @@
 import os
 import llm_backend
-import llm_providers
 import re
 import sys
 import uuid
@@ -185,61 +184,6 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     if header:
         return header
     return os.environ.get("GEMINI_API_KEY")
-
-
-def resolve_llm_provider(request: Request) -> Optional[dict]:
-    """Per-job third-party provider snapshot from the X-LLM-* headers, or None.
-
-    Returns ``{"provider", "model", "api_key"}`` with the fixed server-side
-    base URL resolved separately. Raises HTTPException 400 on unknown IDs or
-    invalid model/key values. ``"gemini"``/empty means Gemini only (None).
-    The key travels in headers, never in the URL, and is passed to the child
-    through its env dict only — never written to ``os.environ`` or disk.
-    """
-    raw_id = (request.headers.get("X-LLM-Provider") or "").strip().lower()
-    if not raw_id or raw_id in ("gemini", "gemini-only", "none"):
-        return None
-    try:
-        pid = llm_providers.canonical_id(raw_id)
-    except ValueError:
-        raise HTTPException(status_code=400,
-                            detail=f"Unknown AI provider: {raw_id!r}")
-    model = (request.headers.get("X-LLM-Model") or "")
-    key = (request.headers.get("X-LLM-Key") or "")
-    try:
-        model = llm_providers.validate_model(model)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid AI model: {e}")
-    try:
-        key = llm_providers.validate_key(key)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid AI key: {e}")
-    return {"provider": pid, "model": model, "api_key": key}
-
-
-# Lightweight per-IP rate limiter for the LLM connection-test endpoint
-# (same sliding-window shape as free_tools.py; in-process by design).
-_LLM_TEST_LIMITS = {"llm_test": {"per_ip": [(600, 20), (86400, 200)], "global_day": 2000}}
-
-
-def _check_llm_test_rate(request: Request):
-    # Dedicated limiter instance so the AI-provider test has its own budget.
-    global _llm_test_limiter
-    try:
-        _llm_test_limiter
-    except NameError:
-        from free_tools import RateLimiter
-        _llm_test_limiter = RateLimiter(_LLM_TEST_LIMITS)
-    from free_tools import client_ip
-    reason = _llm_test_limiter.check("llm_test", client_ip(request))
-    if reason == "ip":
-        raise HTTPException(status_code=429, detail={
-            "code": "rate_limited",
-            "message": "Too many requests from your network. Try again in a few minutes."})
-    if reason == "global":
-        raise HTTPException(status_code=429, detail={
-            "code": "busy",
-            "message": "This tool hit its daily limit. It resets at midnight UTC."})
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -1122,8 +1066,7 @@ def _recover_jobs_from_disk():
                 'logs': _TimedLog(["♻️ Job recovered from disk after server restart."]),
                 'output_dir': job_path,
                 'user_id': owner,
-                'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis'),
-                           'provider': data.get('provider')},
+                'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
             }
             recovered += 1
         except Exception as e:
@@ -1423,8 +1366,7 @@ def _install_drain_signal_handler():
 
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
                            webhook_url=None, webhook_secret=None, base_url=None,
-                           partial=None, source_cap_minutes=None, skip_statics=False,
-                           llm_provider=None):
+                           partial=None, source_cap_minutes=None, skip_statics=False):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
         with open(path, "w") as f:
@@ -1448,9 +1390,6 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "source_cap_minutes": source_cap_minutes,
                 # The probe's "statics bot-checked for this video" verdict.
                 "skip_statics": bool(skip_statics),
-                # Per-job AI provider ID only (never the key): on resume the
-                # key is gone, so the job falls back to Gemini (see below).
-                "llm_provider": llm_provider,
             }, f)
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
@@ -1554,14 +1493,6 @@ def _resume_interrupted_jobs() -> set:
             env["DOWNLOAD_SKIP_STATICS"] = "1"
         else:
             env.pop("DOWNLOAD_SKIP_STATICS", None)
-        if m.get("llm_provider"):
-            # The per-job LLM key was never persisted (crash-recovery rule),
-            # so a resumed job cannot keep its primary provider: Gemini picks
-            # up the transcript stages instead.
-            for _k in ("LLM_PROVIDER_ID", "LLM_API_KEY"):
-                env.pop(_k, None)
-            print(f"♻️ Job {job_id} resumes on Gemini "
-                  f"(its AI provider key was not kept).")
 
         m["attempts"] = attempts
         try:
@@ -2748,8 +2679,7 @@ async def run_job(job_id, job_data):
                                  ready_clips.append(clip)
                         
                         if ready_clips:
-                             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis,
-                                                       'provider': data.get('provider')}
+                             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
             except Exception as e:
                 # Ignore read errors during processing
                 pass
@@ -2794,8 +2724,7 @@ async def run_job(job_id, job_data):
                     if missing:
                         jobs[job_id]['logs'].append(
                             f"⚠️ {missing} of {len(clips)} clips failed to render.")
-                    jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis,
-                                                      'provider': data.get('provider')}
+                    jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -2838,81 +2767,7 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
-        "llmProviders": sorted(llm_providers.PROVIDERS.keys()),
     }
-
-
-class LlmTestRequest(BaseModel):
-    provider: str = ""
-    model: str = ""
-    api_key: str = ""
-
-
-@app.post("/api/llm-test")
-async def llm_test_endpoint(payload: LlmTestRequest, request: Request):
-    """Lightweight connection test for the optional AI provider.
-
-    Sends a tiny JSON request (one short completion) and reports a precise
-    outcome: ok + latency / key rejected / model not found / timeout /
-    rate limited. Rate-limited per IP (free_tools-style). Never logs or
-    returns the key.
-    """
-    _check_llm_test_rate(request)
-    try:
-        pid = llm_providers.canonical_id(payload.provider)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unknown AI provider")
-    try:
-        model = llm_providers.validate_model(payload.model)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid AI model: {e}")
-    try:
-        key = llm_providers.validate_key(payload.api_key)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid AI key: {e}")
-    base = llm_providers.base_url_for(pid)
-    config = {"provider": pid, "base_url": base, "model": model,
-              "api_key": key,
-              "extra_headers": llm_providers.extra_headers(pid)}
-
-    class _TinySchema(BaseModel):
-        ok: bool
-
-    prompt = ('Reply with exactly {"ok": true} and nothing else.')
-    started = time.monotonic()
-    try:
-        parsed, _cost = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: llm_backend.generate_json(prompt, _TinySchema, config=config))
-        latency_ms = int((time.monotonic() - started) * 1000)
-        if parsed.get("ok") is True:
-            return {"ok": True, "latency_ms": latency_ms}
-        return {"ok": True, "latency_ms": latency_ms}
-    except llm_backend.ProviderCallError as e:
-        kind = getattr(e, "kind", "bad_response")
-        msg = llm_providers.scrub(str(e))[:300]
-        if kind == "auth":
-            raise HTTPException(status_code=401, detail={
-                "code": "key_rejected",
-                "message": f"Key rejected by {pid}: {msg}"})
-        if kind == "model_not_found":
-            detail = {"code": "model_not_found",
-                      "message": f"Model not found on {pid}: {msg}"}
-            if pid == "opencode-zen":
-                detail["message"] += " " + llm_providers.ZEN_404_HINT
-            raise HTTPException(status_code=404, detail=detail)
-        if kind == "quota":
-            raise HTTPException(status_code=402, detail={
-                "code": "quota", "message": f"Insufficient credits/quota on {pid}: {msg}"})
-        if kind == "transient":
-            raise HTTPException(status_code=504, detail={
-                "code": "transient",
-                "message": f"{pid} did not answer in time or is rate limiting: {msg}"})
-        raise HTTPException(status_code=502, detail={
-            "code": "provider_error", "message": f"{pid}: {msg}"})
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={
-            "code": "provider_error",
-            "message": llm_providers.scrub(f"{pid}: {e}")[:300]})
 
 async def _probe_youtube_quality(url: str) -> dict:
     """Run quality_probe.py in a worker thread; {} on any failure (fail-open)."""
@@ -3323,15 +3178,6 @@ async def process_endpoint(
         env["GEMINI_API_KEY"] = api_key # Override with key from request
     else:
         env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
-    # Optional per-job primary AI provider for the transcript stages (headers,
-    # never the URL). Snapshot into the child env only — os.environ is global
-    # to concurrent jobs and must not see it.
-    llm_provider = resolve_llm_provider(request)
-    if llm_provider:
-        env["LLM_PROVIDER_ID"] = llm_provider["provider"]
-        env["LLM_BASE_URL"] = llm_providers.base_url_for(llm_provider["provider"])
-        env["LLM_MODEL"] = llm_provider["model"]
-        env["LLM_API_KEY"] = llm_provider["api_key"]
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job
@@ -3558,8 +3404,7 @@ async def process_endpoint(
                            watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
                            base_url=api_base, partial=partial,
-                           source_cap_minutes=source_cap, skip_statics=skip_statics,
-                           llm_provider=(llm_provider or {}).get("provider"))
+                           source_cap_minutes=source_cap, skip_statics=skip_statics)
 
     _enqueue_job(job_id, priority)
 
