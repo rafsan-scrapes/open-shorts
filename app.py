@@ -30,6 +30,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
+import profanity
 import layout_ranges
 import watermarked
 import media_auth
@@ -701,6 +702,7 @@ def _canonical_clip_file(output_dir, base_name, index):
         # the clean file itself: the * matches nothing), written last.
         derived = (glob.glob(os.path.join(output_dir, f"subtitled_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"recut_*_{clean}"))
+                   + glob.glob(os.path.join(output_dir, f"bleeped_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hooked_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hook_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"wm_*{clean}")))
@@ -4410,6 +4412,10 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         # captions from the transcript (in the recorded style, if any).
         if clip.get('caption_words'):
             updates['caption_words'] = None
+        # Bleep intervals are timed against the previous cut; drop them rather
+        # than mute the wrong words on the new timeline (re-bleep instead).
+        if clip.get('bleeps'):
+            updates['bleeps'] = None
         clip.update(updates)
         data['shorts'] = clips
         with open(json_files[0], 'w') as f:
@@ -4436,6 +4442,238 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             await _metering.release_reservation(reservation_id)
         print(f"❌ Rerender Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class BleepInterval(BaseModel):
+    start: float
+    end: float
+
+
+class BleepRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    input_filename: Optional[str] = None
+    # auto: detect from transcript wordlist; manual: use intervals only;
+    # both (default): union of the two.
+    mode: str = "both"
+    extra_words: List[str] = []
+    intervals: List[BleepInterval] = []
+    mask_captions: bool = True
+
+
+@app.post("/api/clip/bleep")
+async def bleep_clip(req: BleepRequest, request: Request):
+    """Mute profanities in a generated clip (post-generation bleep).
+
+    Mutes the caption-free base (`-c:v copy -af volume=0:enable=...`, so it
+    is fast and lossless) and burns captions back on last — masked (`f***`)
+    when mask_captions, verbatim otherwise. Follows the /api/edit chaining
+    invariant via input_filename; result is a `bleeped_<ts>_` derivative
+    delivered through _deliver. Re-bleeps peel prior bleep layers and mute
+    from the pre-bleep file with the union of stored + new intervals.
+    """
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            raise HTTPException(status_code=404, detail="Metadata not found")
+        with open(json_files[0], 'r') as f:
+            data = json.load(f)
+        clips = data.get('shorts', [])
+        if req.clip_index < 0 or req.clip_index >= len(clips):
+            raise HTTPException(status_code=404, detail="Clip not found")
+        clip = clips[req.clip_index]
+        transcript = data.get('transcript')
+
+        mode = (req.mode or "both").lower()
+        if mode not in ("auto", "manual", "both"):
+            raise HTTPException(
+                status_code=400,
+                detail="mode must be one of: auto, manual, both")
+
+        # Clip-relative transcript words (recut-aware, same as /api/subtitle).
+        recipe_segments = (clip.get('recipe') or {}).get('segments')
+        if recipe_segments:
+            clip_transcript = recut.virtual_transcript(
+                transcript or {}, recipe_segments)
+            clip_duration = recut.total_duration(recipe_segments)
+        else:
+            clip_transcript = transcript or {}
+            clip_duration = (
+                float(clip.get('end', 0) or 0) - float(clip.get('start', 0) or 0))
+
+        flat_words = []
+        for seg in (clip_transcript.get('segments') or []):
+            for w in seg.get('words') or []:
+                try:
+                    flat_words.append({
+                        "word": str(w.get('word', '')),
+                        "start": float(w['start']), "end": float(w['end'])})
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        auto_hits = []
+        if mode in ("auto", "both"):
+            if not transcript:
+                if mode == "auto":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Transcript not found in metadata.")
+            else:
+                wlist = [{"w": w["word"], "s": w["start"], "e": w["end"]}
+                         for w in flat_words]
+                auto_hits = profanity.find_profanity(
+                    wlist, extra_words=req.extra_words)
+
+        manual = [{"start": iv.start, "end": iv.end}
+                  for iv in (req.intervals or [])]
+        auto_intervals = [{"start": h["s"], "end": h["e"]} for h in auto_hits]
+        combined = (auto_intervals + manual) if mode == "both" else (
+            auto_intervals if mode == "auto" else manual)
+        if not combined:
+            raise HTTPException(
+                status_code=400, detail="No profanity found to bleep.")
+        try:
+            bleep_intervals = profanity.normalize_intervals(
+                combined, clip_duration or None)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        if req.input_filename:
+            filename = os.path.basename(req.input_filename)
+        else:
+            filename = (clip.get('video_url') or '').split('/')[-1]
+        filename = _strip_watermark_copy(output_dir, filename)
+        if not os.path.exists(os.path.join(output_dir, filename)):
+            raise HTTPException(
+                status_code=404, detail=f"Video file not found: {filename}")
+
+        # Peel prior bleep layers back to the pre-bleep file: re-bleeps mute
+        # from there with the union of old + new intervals, so mute-on-mute
+        # never stacks and captions never double-burn. (Prior intervals are
+        # clip-relative; a recut changes the timeline, so _rerender_locked
+        # clears the stored bleeps.)
+        pre_bleep = filename
+        while True:
+            m = re.match(r'^bleeped_\d+_[a-f0-9]+_(.+)$', pre_bleep)
+            if not m or not os.path.exists(
+                    os.path.join(output_dir, m.group(1))):
+                break
+            pre_bleep = m.group(1)
+        prior = []
+        for b in (clip.get('bleeps') or []):
+            prior.extend(b.get('intervals') or [])
+        # Mute the caption-free base (same invariant as /api/edit): captions
+        # always go back on last, masked or verbatim.
+        mute_src = _strip_burned_captions(output_dir, pre_bleep)
+        had_captions = mute_src != pre_bleep
+        try:
+            bleep_intervals = profanity.normalize_intervals(
+                prior + [{"start": iv["start"], "end": iv["end"]}
+                         for iv in bleep_intervals],
+                clip_duration or None)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        mute_src_path = os.path.join(output_dir, mute_src)
+        if not os.path.exists(mute_src_path):
+            raise HTTPException(
+                status_code=404, detail=f"Video file not found: {mute_src}")
+
+        def run_bleep():
+            from ffmpeg_utils import METADATA_SCRUB
+            generation_id = int(time.time())
+            out_name = (f"bleeped_{generation_id}_{uuid.uuid4().hex[:6]}"
+                        f"_{mute_src}")
+            out_path = os.path.join(output_dir, out_name)
+            af = profanity.build_mute_filter(bleep_intervals)
+            cmd = ["ffmpeg", "-y", "-i", mute_src_path,
+                   "-c:v", "copy", "-af", af, "-c:a", "aac",
+                   *METADATA_SCRUB, "-movflags", "+faststart", out_path]
+            result = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=1800)
+            if result.returncode != 0:
+                tail = (result.stderr or b"").decode(
+                    "utf-8", "replace")[-400:]
+                raise RuntimeError(f"ffmpeg bleep failed: {tail}")
+            return out_name, out_path
+
+        reservation_id = await reserve_managed_action(
+            request, 0, req.job_id, "bleep")
+        try:
+            loop = asyncio.get_event_loop()
+            out_name, out_path = await loop.run_in_executor(None, run_bleep)
+
+            served_name = out_name
+            if (req.mask_captions or had_captions) and flat_words:
+                try:
+                    if req.mask_captions:
+                        # Mask words whose time falls inside a bleep interval.
+                        to_mask = []
+                        for w in flat_words:
+                            for iv in bleep_intervals:
+                                if (w["end"] > iv["start"]
+                                        and w["start"] < iv["end"]):
+                                    to_mask.append(
+                                        {"s": w["start"], "e": w["end"]})
+                                    break
+                        words = profanity.mask_transcript_words(
+                            flat_words, to_mask)
+                    else:
+                        words = flat_words
+                    masked_transcript = _words_transcript(
+                        [{"word": w["word"], "start": w["start"],
+                          "end": w["end"]} for w in words],
+                        (transcript or {}).get("language", "en"))
+                    captioner = _recut_captioner(clip)
+                    if captioner is not None:
+                        captioned = captioner(
+                            out_path, masked_transcript, 0.0,
+                            max(w["end"] for w in words))
+                    else:
+                        import main as _main
+                        captioned = _main.auto_caption_clip(
+                            out_path, masked_transcript, 0.0,
+                            max(w["end"] for w in words))
+                    if captioned:
+                        served_name = os.path.basename(captioned)
+                except Exception as e:
+                    print(f"⚠️  Bleep caption masking skipped: {e}")
+
+            served_name = await _deliver(request, req.job_id, served_name)
+            new_video_url = f"/videos/{req.job_id}/{served_name}"
+            bleeps = clip.get('bleeps') or []
+            bleeps.append({"intervals": bleep_intervals,
+                           "at": int(time.time())})
+            updates = {'video_url': new_video_url, 'bleeps': bleeps}
+            clip.update(updates)
+            data['shorts'] = clips
+            with open(json_files[0], 'w') as f:
+                json.dump(data, f, indent=2)
+            mem_clips = (job.get('result') or {}).get('clips') or []
+            if req.clip_index < len(mem_clips):
+                mem_clips[req.clip_index].update(updates)
+            _archive_clip_edit_bg(req.job_id, req.clip_index, served_name)
+            if reservation_id:
+                await _metering.commit_reservation(reservation_id)
+            return {"success": True, "new_video_url": new_video_url,
+                    "intervals": bleep_intervals,
+                    "auto_hits": len(auto_hits)}
+        except HTTPException:
+            raise
+        except Exception as e:
+            if reservation_id:
+                await _metering.release_reservation(reservation_id)
+            print(f"❌ Bleep Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Manual framing -----------------------------------------------------------

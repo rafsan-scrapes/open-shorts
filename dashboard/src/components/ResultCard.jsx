@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp, VolumeX } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
+import BleepModal from './BleepModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
@@ -211,6 +212,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [isSubtitling, setIsSubtitling] = useState(false);
     const [isHooking, setIsHooking] = useState(false);
     const [isTranslating, setIsTranslating] = useState(false);
+    const [isBleeping, setIsBleeping] = useState(false);
+    const [showBleepModal, setShowBleepModal] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
@@ -237,7 +240,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // True when the current server file already carries burned-in content.
     // Browser (Remotion) renders compose over the ORIGINAL clip, so using them
     // here would silently drop those burns — chain via server FFmpeg instead.
-    const hasServerBurns = /(^|_)(subtitled|hook|hooked)_/.test(serverVideoFile || '');
+    const hasServerBurns = /(^|_)(subtitled|hook|hooked|bleeped)_/.test(serverVideoFile || '');
 
     // The hook currently burned into the server file (auto-hook or a manual
     // one). /api/hook REPLACES it; tracked locally so the modal stays honest
@@ -596,6 +599,53 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             setTimeout(() => setEditError(null), 5000);
         } finally {
             setIsHooking(false);
+        }
+    };
+
+    // Mute profanities to silence (post-generation bleep). Server mutes the
+    // caption-free base and burns captions back masked, so this chains like
+    // every other server op: input is the current server file, output becomes it.
+    const handleBleep = async ({ intervals, extra_words, mask_captions }) => {
+        setIsBleeping(true);
+        setEditError(null);
+        try {
+            const res = await apiFetch('/api/clip/bleep', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    input_filename: serverVideoFile,
+                    // Checked words + manual ranges travel as explicit
+                    // intervals; extra words let the server catch anything the
+                    // preview wordlist missed.
+                    mode: 'both',
+                    extra_words: extra_words || [],
+                    intervals: intervals || [],
+                    mask_captions: mask_captions !== false,
+                }),
+            });
+            if (!res.ok) {
+                const errText = await res.text();
+                try {
+                    throw new Error(JSON.parse(errText).detail || errText);
+                } catch (e) {
+                    if (e.message !== errText) throw e;
+                    throw new Error(errText);
+                }
+            }
+            const data = await res.json();
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setServerVideoFile(data.new_video_url.split('/').pop());
+                if (videoRef.current) videoRef.current.load();
+                setShowBleepModal(false);
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setIsBleeping(false);
         }
     };
 
@@ -974,6 +1024,15 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </button>
 
                     <button
+                        onClick={() => setShowBleepModal(true)}
+                        disabled={isBleeping}
+                        className={QUIET_BTN}
+                    >
+                        {isBleeping ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <VolumeX size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
+                        {isBleeping ? 'muting…' : 'bleep'}
+                    </button>
+
+                    <button
                         onClick={() => setShowModal(true)}
                         className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap"
                     >
@@ -1199,6 +1258,15 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 isProcessing={isTranslating}
                 videoUrl={currentVideoUrl}
                 hasApiKey={!!elevenLabsKey}
+            />
+
+            <BleepModal
+                isOpen={showBleepModal}
+                onClose={() => setShowBleepModal(false)}
+                onBleep={handleBleep}
+                isProcessing={isBleeping}
+                jobId={jobId}
+                clipIndex={index}
             />
 
             {showWatermarkModal && (
