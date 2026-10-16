@@ -17,9 +17,12 @@ DEFAULT_WORDLIST = frozenset({
     "nigger", "nigga", "faggot", "retard",
 })
 
-MAX_INTERVALS = 20
+MAX_INTERVALS = 100
 MIN_INTERVAL_SECONDS = 0.1
 MUTE_PAD_SECONDS = 0.05
+# Raw-input guard against abusive payloads; the user-facing limit is
+# MAX_INTERVALS enforced post-merge (see normalize_intervals).
+MAX_RAW_INTERVALS = 1000
 
 
 def wordlist():
@@ -82,10 +85,16 @@ def mask_transcript_words(words, hits):
 
 
 def normalize_intervals(intervals, duration=None):
-    """Validate/clamp/merge bleep intervals. Returns [{start, end}]."""
+    """Validate/clamp/merge bleep intervals. Returns [{start, end}].
+
+    Dedupe/merge happens before the MAX_INTERVALS check, so retrying the
+    same bleep (mode='both' re-detects checked words; re-bleeps union prior
+    + new intervals) never trips the cap on duplicates. The cap applies to
+    the merged filter count actually passed to FFmpeg.
+    """
     if not isinstance(intervals, (list, tuple)) or not intervals:
         raise ValueError("intervals must be a non-empty list")
-    if len(intervals) > MAX_INTERVALS:
+    if len(intervals) > MAX_RAW_INTERVALS:
         raise ValueError(f"too many intervals (max {MAX_INTERVALS})")
     cleaned = []
     for i, iv in enumerate(intervals):
@@ -112,6 +121,8 @@ def normalize_intervals(intervals, duration=None):
             merged[-1]["end"] = max(merged[-1]["end"], iv["end"])
         else:
             merged.append(dict(iv))
+    if len(merged) > MAX_INTERVALS:
+        raise ValueError(f"too many intervals (max {MAX_INTERVALS})")
     return merged
 
 
